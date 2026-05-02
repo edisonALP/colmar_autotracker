@@ -2,6 +2,8 @@
 
 GUI-Tool für automatische COLMAP-Photogrammetrie-Pipelines. Videos rein, Sparse-Rekonstruktion raus.
 
+> Basiert auf der Arbeit von [@polyfjord](https://gist.github.com/polyfjord/4ed7e8988bdb9674145f1c270440200d)
+
 ## Pipeline
 
 Für jedes Video im gewählten Ordner:
