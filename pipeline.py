@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -23,6 +24,8 @@ class PipelineSettings:
     max_image_size: int = 4096
     subsampling: str = "every_frame"  # every_frame | every_2nd | every_3rd | custom_fps
     custom_fps: int = 10
+    tri_min_angle: float = 1.0
+    focal_length_35mm: float | None = None  # None = COLMAP schätzt selbst
 
 
 @dataclass
@@ -157,6 +160,32 @@ class PipelineRunner:
         img_dir.mkdir(parents=True)
         sparse_dir.mkdir(parents=True)
 
+        fps = self._get_video_fps(str(video))
+        focal_35mm = self.settings.focal_length_35mm or self._get_focal_length_from_metadata(str(video))
+        self._resolved_focal_35mm = focal_35mm
+
+        if fps:
+            self.log_cb(
+                f"[INFO] Video FPS: {fps} → Blender Scene FPS auf {fps} setzen vor Import!",
+                "ok",
+            )
+        if focal_35mm:
+            source = "Metadaten" if not self.settings.focal_length_35mm else "Manuell"
+            self.log_cb(f"[INFO] Brennweite: {focal_35mm}mm (35mm-Äquiv.) [{source}]", "ok")
+        else:
+            self.log_cb("[WARNUNG] Brennweite unbekannt – COLMAP schätzt selbst (niedriger Quality)", "info")
+
+        (scene / "blender_info.txt").write_text(
+            f"Video: {video.name}\n"
+            f"FPS: {fps or 'unbekannt'}\n"
+            f"Brennweite (35mm): {focal_35mm or 'unbekannt'}\n"
+            f"\n"
+            f"Blender Setup:\n"
+            f"  1. Scene Properties → Frame Rate → {fps or '?'}\n"
+            f"  2. Dann Tracking-Daten importieren\n",
+            encoding="utf-8",
+        )
+
         steps = [
             (self._run_ffmpeg, [str(video), str(img_dir)]),
             (self._run_feature_extractor, [str(scene), str(img_dir)]),
@@ -177,9 +206,13 @@ class PipelineRunner:
 
         self.log_cb(f"[OK] {video.name} fertig", "ok")
 
-    def _get_video_duration(self, video: str) -> float | None:
+    def _get_ffprobe(self) -> str | None:
         ffprobe = os.path.join(os.path.dirname(self.bins.ffmpeg), "ffprobe.exe")
-        if not os.path.isfile(ffprobe):
+        return ffprobe if os.path.isfile(ffprobe) else None
+
+    def _get_video_duration(self, video: str) -> float | None:
+        ffprobe = self._get_ffprobe()
+        if not ffprobe:
             return None
         cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=duration", "-of", "csv=p=0", video]
@@ -187,6 +220,59 @@ class PipelineRunner:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             val = result.stdout.strip()
             return float(val) if val else None
+        except Exception:
+            return None
+
+    def _get_focal_length_from_metadata(self, video: str) -> float | None:
+        """Try to extract 35mm-equivalent focal length from video stream metadata."""
+        ffprobe = self._get_ffprobe()
+        if not ffprobe:
+            return None
+        cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
+               "-show_streams", "-show_format", video]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            data = json.loads(result.stdout)
+        except Exception:
+            return None
+
+        # Search common metadata tag names for focal length
+        tag_names = [
+            "com.apple.quicktime.camera.focal_length",
+            "focal_length", "FocalLength", "Focal_Length",
+            "focalLength", "FOCAL_LENGTH",
+        ]
+        sources = []
+        for stream in data.get("streams", []):
+            sources.append(stream.get("tags", {}))
+        sources.append(data.get("format", {}).get("tags", {}))
+
+        for tags in sources:
+            for key in tag_names:
+                val = tags.get(key)
+                if val is not None:
+                    try:
+                        return float(str(val).split("/")[0]) / float(str(val).split("/")[1]) \
+                            if "/" in str(val) else float(val)
+                    except Exception:
+                        continue
+        return None
+
+    def _get_video_fps(self, video: str) -> float | None:
+        ffprobe = self._get_ffprobe()
+        if not ffprobe:
+            return None
+        cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", video]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            val = result.stdout.strip()
+            if not val:
+                return None
+            if "/" in val:
+                num, den = val.split("/")
+                return round(int(num) / int(den), 3) if int(den) else None
+            return float(val)
         except Exception:
             return None
 
@@ -266,6 +352,15 @@ class PipelineRunner:
             "--FeatureExtraction.use_gpu", "1" if self.settings.use_gpu else "0",
             "--FeatureExtraction.max_image_size", str(self.settings.max_image_size),
         ]
+        focal_35mm = getattr(self, "_resolved_focal_35mm", None)
+        if focal_35mm:
+            # Focal length in pixels: f_px = f_35mm * image_width / 36.0
+            # Use max_image_size as width proxy; COLMAP rescales internally
+            f_px = focal_35mm * self.settings.max_image_size / 36.0
+            cmd += [
+                "--ImageReader.camera_model", "SIMPLE_RADIAL",
+                "--ImageReader.camera_params", f"{f_px:.2f},0,0,0",
+            ]
         return self._run(cmd)
 
     def _run_matcher(self, scene: str) -> bool:
@@ -284,7 +379,6 @@ class PipelineRunner:
         cmd = [
             self.bins.colmap, "view_graph_calibrator",
             "--database_path", f"{scene}/database.db",
-            "--image_path", img_dir,
         ]
         self._run(cmd)
         return True  # non-fatal
@@ -297,6 +391,7 @@ class PipelineRunner:
             "--database_path", f"{scene}/database.db",
             "--image_path", img_dir,
             "--output_path", sparse_dir,
+            "--GlobalMapper.tri_min_angle", str(self.settings.tri_min_angle),
         ]
         return self._run(cmd)
 

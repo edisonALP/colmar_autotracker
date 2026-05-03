@@ -29,6 +29,14 @@ STATUS_BG = "#007acc"
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+SHOT_PRESETS = {
+    "Standard": {"overlap": 15, "tri_min_angle": 1.0},
+    "Klippe / Weiter Hintergrund": {"overlap": 45, "tri_min_angle": 0.5},
+    "Interior / Nahaufnahme": {"overlap": 10, "tri_min_angle": 2.0},
+    "Drohne / Luftaufnahme": {"overlap": 30, "tri_min_angle": 0.5},
+    "Handheld / Schnellschnitt": {"overlap": 20, "tri_min_angle": 1.5},
+}
+
 
 class AutoTrackerApp(ctk.CTk):
     def __init__(self):
@@ -166,8 +174,8 @@ class SettingsPanel(ctk.CTkFrame):
         self._drop_hint.pack()
 
         self._drop_path = tk.Label(
-            self._drop_zone, textvariable=self._folder_var, bg=BG, fg=TEXT,
-            font=("Consolas", 8), wraplength=170, justify="center",
+            self._drop_zone, text=self._truncate_path(self._folder_var.get()),
+            bg=BG, fg=TEXT, font=("Consolas", 8), wraplength=170, justify="center",
         )
         self._drop_path.pack(pady=(2, 2))
 
@@ -196,6 +204,19 @@ class SettingsPanel(ctk.CTkFrame):
         # Divider + label
         ctk.CTkFrame(self, fg_color=BORDER, height=1, corner_radius=0).pack(
             fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(self, text="SHOT PRESET", text_color=LABEL,
+                     font=ctk.CTkFont(size=10)).pack(anchor="w", **pad)
+        self._preset_var = tk.StringVar(value="Standard")
+        self._tri_min_angle = 1.0
+        ctk.CTkOptionMenu(self, values=list(SHOT_PRESETS.keys()),
+                          variable=self._preset_var,
+                          fg_color=BG, button_color=BORDER, button_hover_color=ACCENT,
+                          text_color=TEXT,
+                          command=self._on_preset_change).pack(
+            fill="x", padx=14, pady=(4, 0))
+
+        ctk.CTkFrame(self, fg_color=BORDER, height=1, corner_radius=0).pack(
+            fill="x", padx=14, pady=(12, 0))
         ctk.CTkLabel(self, text="EINSTELLUNGEN", text_color=LABEL,
                      font=ctk.CTkFont(size=10)).pack(anchor="w", **pad)
 
@@ -218,7 +239,7 @@ class SettingsPanel(ctk.CTkFrame):
         self._overlap_label = ctk.CTkLabel(overlap_row, text="15", text_color=ACCENT,
                                             font=ctk.CTkFont(size=11), width=24)
         self._overlap_label.pack(side="right")
-        ctk.CTkSlider(overlap_row, from_=1, to=30, number_of_steps=29,
+        ctk.CTkSlider(overlap_row, from_=1, to=60, number_of_steps=59,
                       variable=self._overlap_var,
                       button_color=ACCENT, progress_color=ACCENT,
                       command=lambda v: self._overlap_label.configure(text=str(int(v)))
@@ -239,6 +260,22 @@ class SettingsPanel(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
         )
         self._max_size_entry.pack(fill="x", padx=14, pady=(2, 0))
+
+        # Focal length
+        fl_row = ctk.CTkFrame(self, fg_color="transparent")
+        fl_row.pack(fill="x", padx=14, pady=(8, 0))
+        ctk.CTkLabel(fl_row, text="Brennweite (35mm)", text_color=TEXT,
+                     font=ctk.CTkFont(size=11)).pack(side="left")
+        self._fl_hint = ctk.CTkLabel(fl_row, text="mm", text_color="#888888",
+                                     font=ctk.CTkFont(size=9))
+        self._fl_hint.pack(side="right")
+        self._focal_var = tk.StringVar(value="")
+        ctk.CTkEntry(
+            self, textvariable=self._focal_var,
+            placeholder_text="auto (aus Metadaten)",
+            fg_color=BG, border_color=BORDER, text_color=TEXT,
+            font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=14, pady=(2, 0))
 
         # Frame subsampling
         ctk.CTkLabel(self, text="Frame Subsampling", text_color=TEXT,
@@ -303,10 +340,21 @@ class SettingsPanel(ctk.CTkFrame):
             return
         self._set_folder(folder)
 
+    @staticmethod
+    def _truncate_path(path: str, max_len: int = 34) -> str:
+        return path if len(path) <= max_len else "..." + path[-(max_len - 3):]
+
     def _set_folder(self, folder: str):
         self._folder_var.set(folder)
+        self._drop_path.configure(text=self._truncate_path(folder))
         self._drop_hint.configure(text="Ordner hier reinziehen")
         self._auto_detect_resolution(folder)
+
+    def _on_preset_change(self, value: str):
+        preset = SHOT_PRESETS[value]
+        self._overlap_var.set(preset["overlap"])
+        self._overlap_label.configure(text=str(preset["overlap"]))
+        self._tri_min_angle = preset["tri_min_angle"]
 
     def _auto_detect_resolution(self, folder: str):
         video_exts = {".mp4", ".mov", ".avi", ".mkv", ".mts", ".m4v"}
@@ -345,6 +393,12 @@ class SettingsPanel(ctk.CTkFrame):
         except (ValueError, TypeError):
             max_size = 4096
             self._max_size_var.set("4096")
+        try:
+            focal = float(self._focal_var.get())
+            focal = focal if focal > 0 else None
+        except (ValueError, TypeError):
+            focal = None
+
         return PipelineSettings(
             videos_dir=self._folder_var.get(),
             use_gpu=self._gpu_var.get(),
@@ -352,6 +406,8 @@ class SettingsPanel(ctk.CTkFrame):
             max_image_size=max_size,
             subsampling=self._subsample_map[self._subsample_var.get()],
             custom_fps=self._fps_var.get(),
+            tri_min_angle=self._tri_min_angle,
+            focal_length_35mm=focal,
         )
 
     def set_running(self, running: bool):
